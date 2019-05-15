@@ -1,0 +1,44 @@
+* Create socket
+* Bind socket
+* Select loop
+* Accept connection(s)
+* Hand connection off to service loop, which must run
+  interlaced with select loop, eg:
+
+  while (true) {
+    /* select */
+    if (new connection) {
+      accept connection;
+      read filename from peer;
+      verify file existence, size;
+      build connection record including
+          new uring, mapped buffers, fixed files;
+      add connection record to async service list;
+    }
+    /* I/O service. */
+    if (any uring requests are complete) {
+      handle them;
+      (which means: which connection? read or write? file complete?
+       if a file read is complete, queue the corresponding socket
+       write)
+    }
+    if (any files with reads to be processed) {
+      queue reads up to that file's uring limit;
+    }
+    if (any files are complete) {
+      tear down their connection;
+      shut down their uring;
+      close their file fd;
+      dispose the connection record;
+    }
+  }
+
+  Timeouts for each of those steps should be configurable,
+  but generally quite short. Or maybe just "if we did
+  NOTHING AT ALL on the last trip through the loop, sleep
+  for one millisecond" or better, set the select() timeout
+  to 1ms in that case, and use 0 by default.
+
+* Could use a fixed array of connection records. But why?
+We may as well just process each connection record in a
+loop, for each of the "if" sections above.
