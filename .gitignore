@@ -1,0 +1,4 @@
+.*.swp
+*.o
+uring_svr
+
