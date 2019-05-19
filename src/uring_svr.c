@@ -16,6 +16,8 @@
  *   that same block to the connected socket.
  * - We *could* start the next read as soon as a read
  *   completes and we've started the corresponding write.
+ *   But right now I just want to get something basic
+ *   working.
  *
  * Copyright (c) 2019 Joseph A. Knapka. All rights reserved.
  */
@@ -42,22 +44,25 @@ struct connection_rec {
 	int file_fd;
 	size_t file_size;
 	size_t remaining;
+	off_t start_offset,offset;
 	int cstat; /* 0 = idle, 1 = waiting for read, 2 = waiting for write. */
 	char* io_buffer;
 };
 
-#define CONN_UNUSED 0
+#define CONN_IDLE 0
 #define CONN_READ 1
 #define CONN_WRITE 2
 
-static const int IOBLOCK_SIZE = 4096;
+static const int IOBLOCK_SIZE = 1024;
+
+static const int URING_DEPTH = 32;
 
 #define MAX_CONNECTIONS 16
 
 static struct connection_rec connections[MAX_CONNECTIONS];
 
-/* The fd of the single io_uring instance. */
-static int uring_fd = -1;
+/* Ths uring instance itself. */
+struct io_uring uring;
 
 static void usage()
 {
@@ -116,7 +121,7 @@ static struct connection_rec* buildConnectionRecord(int conn_fd)
 	conn_rec->file_size = stat_buf.st_size;
 	conn_rec->remaining = stat_buf.st_size;
 	conn_rec->io_buffer = (char*)malloc(IOBLOCK_SIZE);
-	conn_rec->cstat = CONN_UNUSED;
+	conn_rec->cstat = CONN_IDLE;
 	if (!conn_rec->io_buffer) {
 		/* Could not allocate a buffer. Free the conn_rec. */
 		conn_rec->conn_fd = -1;
@@ -126,9 +131,27 @@ static struct connection_rec* buildConnectionRecord(int conn_fd)
 	return conn_rec;
 }
 
-int setupUring()
+static int setupUring(struct io_uring* uring)
 {
-	return -1;
+	int rc;
+	rc = io_uring_queue_init(URING_DEPTH,uring,0);
+	if (rc < 0) {
+		perror("setup uring");
+		return -1;
+	}
+	return rc;
+}
+
+static void queue_read(struct connection_rec *crec)
+{
+
+}
+
+static void processConnection(struct connection_rec *crec) {
+	if (crec->cstat == CONN_IDLE) {
+		/* This is a new connection. We must queue a file read. */
+		queue_read(crec);
+	}
 }
 
 int main(int argc,char *argv[])
@@ -147,8 +170,8 @@ int main(int argc,char *argv[])
 
 	initConnections();
 
-	uring_fd = setupUring();
-	if (uring_fd < 0) {
+	rc = setupUring(&uring);
+	if (rc < 0) {
 		perror("set up io_uring");
 		exit(errno);
 	}
@@ -179,6 +202,7 @@ int main(int argc,char *argv[])
 		int conn_fd;
 		socklen_t peerlen = sizeof(peer);
 		struct connection_rec* conn_rec;
+		int conn_idx;
 		if (did_something) {
 			timeout.tv_usec = 0;
 		} else {
@@ -189,20 +213,32 @@ int main(int argc,char *argv[])
 			perror("select");
 			exit(errno);
 		}
-		conn_fd = accept(sock,(struct sockaddr*)&peer,&peerlen);
-		if (conn_fd < 0) {
-			perror("accept");
-			exit(errno);
+		if (rc > 0) {
+			conn_fd = accept(sock,(struct sockaddr*)&peer,&peerlen);
+			if (conn_fd < 0) {
+				perror("accept");
+				exit(errno);
+			}
+
+			/* We have a new connection. Start handling it. */
+			conn_rec = buildConnectionRecord(conn_fd);
+			if (!conn_rec) {
+				/* Too many connections. */
+				write(conn_fd,(void*)"Too many connections",20);
+				close(conn_fd);
+			}
+			
+			did_something = 1;
 		}
 
-		/* We have a new connection. Start handling it. */
-		conn_rec = buildConnectionRecord(conn_fd);
-		if (!conn_rec) {
-			/* Too many connections. */
-			write(conn_fd,(void*)"Too many connections",20);
-			close(conn_fd);
+		/* Check each in-use connection_rec and see if we need
+		   to queue up an I/O operation. */
+		for (conn_idx=0; conn_idx<sizeof(connections)/sizeof(connections[0]); ++conn_idx) {
+			if (connections[conn_idx].conn_fd > 0) {
+				/* This connection is in use. Process it. */
+				processConnection(&connections[conn_idx]);
+			}
 		}
-
 	}
 
 	close(sock);
