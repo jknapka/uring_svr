@@ -96,18 +96,41 @@ static struct connection_rec* getConnectionRecord()
 	return 0;
 }
 
-static struct connection_rec* buildConnectionRecord(int conn_fd)
+static int readFname(int fd,char *fname,size_t len)
 {
-	char fname[1024];
+	int rc, got_nl;
+	char *fend, *rd_at, *nl;
+
+	rd_at = fname;
+	fend = fname+len;
+	nl = 0;
+
+	memset(fname,0,len);
+
+	while (!nl && (rd_at < fend)) {
+		len = fend - rd_at;
+		rc = read(fd,(void*)rd_at,len);
+		if (rc < 0) {
+			perror("reading filename");
+			return errno;
+		}
+		if (nl = strchr(rd_at,'\n')) {
+			*nl = 0;
+		} else {
+			rd_at += rc;
+		}
+	}
+
+	if (verbose) printf("Read filename: %s %ld\n",fname,strlen(fname));
+
+	return 0;
+}
+
+static struct connection_rec* buildConnectionRecord(int conn_fd,char* fname)
+{
 	int rc, file_fd, uring_fd;
 	struct stat stat_buf;
 	struct connection_rec* conn_rec;
-
-	memset(fname,0,sizeof(fname));
-	/* This is half-assed, fix plz. */
-	rc = read(conn_fd,(void*)fname,sizeof(fname));
-
-	if (verbose) printf("Read filename: %s %ld\n",fname,strlen(fname));
 
 	file_fd = open(fname,O_RDONLY);
 	if (file_fd < 0) {
@@ -190,8 +213,11 @@ static int queue_write(struct connection_rec *crec)
 
 static void shutdownConnection(struct connection_rec *crec)
 {
-	close(crec->conn_fd);
-	close(crec->file_fd);
+	int rc;
+	rc = close(crec->conn_fd);
+	if (verbose) printf("closed connection, rc=%d\n",rc);
+	rc = close(crec->file_fd);
+	if (verbose) printf("closed file, rc=%d\n",rc);
 	crec->conn_fd = -1; /* Frees the connection_rec. */
 }
 
@@ -289,6 +315,8 @@ int main(int argc,char *argv[])
 	int did_something;
 	struct timeval timeout;
 	int one = 1;
+#define FNAME_SZ 1024
+	char fname[FNAME_SZ];
 
 	if (argc < 2) {
 		usage();
@@ -362,11 +390,14 @@ int main(int argc,char *argv[])
 			}
 
 			/* We have a new connection. Start handling it. */
-			conn_rec = buildConnectionRecord(conn_fd);
-			if (!conn_rec) {
-				/* Too many connections. */
-				rc = write(conn_fd,(void*)"Too many connections",20);
-				close(conn_fd);
+			rc = readFname(conn_fd,fname,FNAME_SZ);
+			if (rc == 0) {
+				conn_rec = buildConnectionRecord(conn_fd,fname);
+				if (!conn_rec) {
+					/* Too many connections. */
+					rc = write(conn_fd,(void*)"Too many connections",20);
+					close(conn_fd);
+				}
 			}
 			
 			did_something = 1;
