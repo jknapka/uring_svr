@@ -1,3 +1,5 @@
+DBGFLAGS = -g
+
 all: uring_svr
 
 uring_svr: uring_svr.o ../../liburing/src/liburing.so.1.0.1
