@@ -39,18 +39,19 @@
  *
  * - Up to MAX_CONNECTIONS connections are supported.
  *
- * - We use a single io_uring for all async I/O requests.
+ * - We use a single kernel io_uring for all async I/O requests.
  *
  * - We allow at most one I/O request to be outstanding
  *   for any given connection, either a read or a write.
  *   We read a block into a buffer from a file, then write
  *   that same block to the connected socket. This is the
- *   main inefficiency in this code. A future version will
+ *   main inefficiency in this code, but it makes the
+ *   bookkeeping dead easy. A future version will
  *   do something smarter.
  *
  * - Remarkably, this code worked correctly the second
  *   time I ran it. The only real issue was getting the
- *   placement of io_uring_sqe_set_data() correct.
+ *   placement of io_uring_sqe_set_data() right.
  *
  * Copyright (c) 2019 Joseph A. Knapka.
  *
@@ -175,7 +176,7 @@ static int readFname(int fd,char *fname,size_t len)
 }
 
 /* Initialize the connection_rec to serve a given filename
-   on a connected socket. Return a pointer to the initialize
+   on a connected socket. Return a pointer to the initialized
    connection_rec, or NULL if initialization fails. */
 static struct connection_rec* buildConnectionRecord(int conn_fd,char* fname)
 {
@@ -259,7 +260,7 @@ static int queue_read(struct connection_rec *crec)
 		crec->iov.iov_len = crec->last_read = crec->remaining;
 	}
 
-	/* Set up the squbmission to the uring. These are wrappers provided
+	/* Set up the submission to the uring. These are wrappers provided
 	   by liburing. */
 
 	/* Set up an async read of an iovec (just one, in this case, but in
@@ -272,7 +273,9 @@ static int queue_read(struct connection_rec *crec)
 			crec->offset); /* The file offset to start reading at. */
 
 	/* Associate this connection_rec with the sqe so that we can retrieve it
-	   when handling the completion of this I/O operation. */
+	   when handling the completion of this I/O operation.
+	   TRAP FOR THE UNWARY: this must be called AFTER io_uring_prep_readv(),
+	   becaue the prep operation resets the data pointer in the SQE. */
 	io_uring_sqe_set_data(sqe,crec);
 
 	/* Actually submit the SQE to the kernel io_uring. This submits
