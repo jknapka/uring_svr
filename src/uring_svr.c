@@ -15,11 +15,17 @@
  * The server will listen for TCP/IP connections on <port>.
  * When one is received, the server reads a newline-terminated
  * filename from the client. It then attempts to open the
- * named file O_RDONLY and serve its contents to the client.
- * When the entire file contents are sent, it closes the
- * client connection. If the file does not exist, an error
+ * named regular file O_RDONLY and serve its contents to the
+ * client. When the entire file contents are sent, it closes
+ * the client connection. If the file does not exist, an error
  * message is written to the client and the connection is
  * closed immediately.
+ *
+ * Note that this is NOT an HTTP server, it uses its own
+ * simple file retrieval protocol. To retrieve a file from
+ * the server:
+ *
+ *  echo <filename> | nc <server.address> <port>
  *
  * Implementation notes:
  *
@@ -29,13 +35,17 @@
  * - The io_uring API is described here:
  *     http://kernel.dk/io_uring.pdf
  *   However, the API has some small differences from what
- *   is described in that document.
+ *   is described in that document (possibly due to typographical
+ *   errors).
  *
  * - This program uses the liburing wrapper around the
  *   kernel API. The best reference to that wrapper is
  *   the example code in the liburing repository, which
  *   can be found here:
  *     http://git.kernel.dk/cgit/liburing
+ *   You must build liburing.so.1.0.1 and possibly fix
+ *   its path name in the Makefile in order for this
+ *   code to link successfully.
  *
  * - Up to MAX_CONNECTIONS connections are supported.
  *
@@ -46,14 +56,16 @@
  *   We read a block into a buffer from a file, then write
  *   that same block to the connected socket. This is the
  *   main inefficiency in this code, but it makes the
- *   bookkeeping dead easy. A future version will
+ *   bookkeeping dead easy. A future version may
  *   do something smarter.
  *
- * - Remarkably, this code worked correctly the second
- *   time I ran it. The only real issue was getting the
- *   placement of io_uring_sqe_set_data() right.
+ * - Remarkably, after fixing compilation errors, this code
+ *   worked correctly the second time I ran it. The only real
+ *   issue was getting the placement of io_uring_sqe_set_data()
+ *   right.
  *
- * Copyright (c) 2019 Joseph A. Knapka.
+ * Copyright (c) 2019 Joseph A. Knapka. All rights reserved
+ * under the provisions of the MIT license.
  *
  * LICENSE: MIT
  */
@@ -90,18 +102,20 @@ struct connection_rec {
 };
 
 /* States of connection_rec->cstat. */
-#define CONN_IDLE 0
-#define CONN_READ 1
-#define CONN_WRITE 2
+#define CONN_IDLE 0          /* The connection is active but no I/O has been queued. */
+#define CONN_READ 1          /* Waiting for a read to complete. */
+#define CONN_WRITE 2         /* Waiting for a write to complete. */
+#define CONN_NEED_REQUEUE 4  /* An I/O operation failed and needs to be retried.
+							    (Or'd with other values.)*/
 
 /* Size of I/O buffers. */
 static const int IOBLOCK_SIZE = 1024;
 
 /* How deep the uring should be */
-static const int URING_DEPTH = 32;
+static const int URING_DEPTH = 128;
 
 /* Maximum number of simultaneous connections we support. */
-#define MAX_CONNECTIONS 16
+#define MAX_CONNECTIONS 128
 
 static const int FNAME_SZ = 1024;
 
@@ -128,6 +142,16 @@ static void initConnections()
 		/* A conn_fd of -1 indicates an unused connection. */
 		connections[ii].conn_fd = -1;
 	}
+}
+
+/* Counts the number of active connections. */
+int countConnections()
+{
+	int ii,count=0;
+	for (ii=0; ii<MAX_CONNECTIONS; ++ii) {
+		count += (connections[ii].conn_fd > 0);
+	}
+	return count;
 }
 
 /* Allocate a connection record if one is available. */
@@ -170,7 +194,7 @@ static int readFname(int fd,char *fname,size_t len)
 		}
 	}
 
-	if (verbose) printf("Read filename: %s %ld\n",fname,strlen(fname));
+	if (verbose >= 4) printf("Read filename: %s %ld\n",fname,strlen(fname));
 
 	return 0;
 }
@@ -287,7 +311,7 @@ static int queue_read(struct connection_rec *crec)
 	   will notify us via the completion queue when the operation
 	   completes. */
 
-	if (verbose) printf("queue_read @offset %ld with %ld remaining\n",crec->offset,crec->remaining);
+	if (verbose >= 5) printf("queue_read @offset %ld with %ld remaining\n",crec->offset,crec->remaining);
 	return 0;
 }
 
@@ -295,37 +319,97 @@ static int queue_read(struct connection_rec *crec)
    This is extremely similar to queue_read(). */
 static int queue_write(struct connection_rec *crec)
 {
+	/* Obtain a submission-queue entry from the kernel, if possible. */
 	struct io_uring_sqe *sqe = io_uring_get_sqe(&uring);
 	if (!sqe) {
 		return -1;
 	}
+
+	/* Set up the connection_rec for a write of its io_buffer. */
 	crec->cstat = CONN_WRITE;
 	crec->iov.iov_base = crec->io_buffer;
-	crec->iov.iov_len = crec->last_read;
+	crec->iov.iov_len = crec->last_read; /* Write only the amount of data we last read. */
+
+	/* io_uring submission logic:
+	   Prepare the write. */
 	io_uring_prep_writev(sqe,crec->conn_fd,&crec->iov,1,0);
+
+	/* Set the data pointer so we can retrieve the connection_rec
+	   upon completion. Again, this must be called AFTER
+	   io_uring_prep_writev(), since the prep operation resets
+	   the SQE's data pointer. */
 	io_uring_sqe_set_data(sqe,crec);
+
+	/* Submit the SQE to the kernel. */
 	io_uring_submit(&uring);
-	if (verbose) printf("queue_write @offset %ld with %ld remaining\n",crec->offset,crec->remaining);
+
+	if (verbose >= 5) printf("queue_write @offset %ld with %ld remaining\n",crec->offset,crec->remaining);
 	return 0;
 }
 
+/* Re-queue a read or write that could not be completed
+   by the kernel. Any adjustments to the data being
+   read or written are handled by the caller. 
+  
+   cqe is the completion that ended unexpectedly.
+   crec is the connection_rec associated with the request.
+   errcode is the error code of the completion. */
+static int requeue(struct io_uring_cqe* cqe,struct connection_rec* crec,int errcode)
+{
+	/* Objtain a new sqe. */
+	struct io_uring_sqe *sqe = io_uring_get_sqe(&uring);
+	if (!sqe) {
+		/* We need to requeue this again after a while. */
+		crec->cstat |= CONN_NEED_REQUEUE;
+		return -1;
+	}
+	if (crec->cstat == CONN_WRITE) {
+		/* This was an incomplete write, so prep a new write. */
+		io_uring_prep_writev(sqe,crec->conn_fd,&crec->iov,1,0);
+	} else {
+		/* This was an incomplate read, so prep a new read. */
+		io_uring_prep_readv(sqe,crec->file_fd,&crec->iov,1,crec->offset);
+	}
+
+	/* Set the data pointer so we can retrieve the connection_rec later.
+	   As in queue_read() and queue_write(), this must be done after
+	   io_uring_prep_*(). */
+	io_uring_sqe_set_data(sqe,crec);
+
+	/* Submit the new SQE. */
+	io_uring_submit(&uring);
+
+	return 0;
+}
+
+/* When a connection's file has been fully sent to the client,
+   close down the connection and the file. */
 static void shutdownConnection(struct connection_rec *crec)
 {
 	int rc;
 	rc = close(crec->conn_fd);
-	if (verbose) printf("closed connection, rc=%d\n",rc);
+	if (verbose >= 3) printf("closed connection, rc=%d\n",rc);
 	rc = close(crec->file_fd);
-	if (verbose) printf("closed file, rc=%d\n",rc);
+	if (verbose >= 3) printf("closed file, rc=%d\n",rc);
 	crec->conn_fd = -1; /* Frees the connection_rec. */
+	if (verbose) printf("-Now serving %d connections.\n",countConnections());
 }
 
+/* If a connection_rec requires any action that is not
+   handled during io_uring completion processing, do
+   that here. */
 static int processConnection(struct connection_rec *crec)
 {
 	if (crec->cstat == CONN_IDLE) {
 		/* This is a new connection. We must queue a file read. */
 		queue_read(crec);
-		return 1;
+	} else if (crec->cstat & CONN_NEED_REQUEUE) {
+		/* A previous I/O operation completed erroneously and
+		   could not be requeued at the time. Try to requeue again. */
+		crec->cstat &= ~CONN_NEED_REQUEUE;
+		requeue(0,crec,0);
 	} else if (crec->remaining == 0) {
+		/* We have successfully read the entire file. */
 		if (crec->cstat == CONN_READ) {
 			/* Last read complete. Queue the corresponding write. */
 			queue_write(crec);
@@ -338,47 +422,40 @@ static int processConnection(struct connection_rec *crec)
 	return 0;
 }
 
-static int requeue(struct io_uring_cqe* cqe,struct connection_rec* crec,int errcode)
-{
-	struct io_uring_sqe *sqe = io_uring_get_sqe(&uring);
-	if (!sqe) {
-		return -1;
-	}
-	if (crec->cstat == CONN_WRITE) {
-		io_uring_prep_writev(sqe,crec->conn_fd,&crec->iov,1,0);
-	} else {
-		io_uring_prep_readv(sqe,crec->file_fd,&crec->iov,1,crec->offset);
-	}
-	io_uring_sqe_set_data(sqe,crec);
-	io_uring_submit(&uring);
-	return 0;
-}
-
+/* Handle the completion of an async I/O operation. */
 static void processCompletion(struct io_uring_cqe *cqe)
 {
+	/* Retrieve the connection_req from the completion queue entry. */
 	struct connection_rec *crec = (struct connection_rec*)io_uring_cqe_get_data(cqe);
+
 	if (cqe->res < 0) {
+		/* An error occurred. */
 		if (cqe->res == -EAGAIN) {
-			if (verbose) printf("requeue (EAGAIN) @offset %ld\n",crec->offset);
+			/* The operation failed. Requeue the entire thing. */
+			if (verbose >= 2) printf("requeue (EAGAIN) @offset %ld\n",crec->offset);
 			requeue(cqe,crec,-EAGAIN);
 		} else {
+			/* We're not sure what happened here... probably best
+			 to shut down the connection. */
 			perror("processing completion");
+			printf("cqe->res == %d, EAGAIN == %d\n",cqe->res,EAGAIN);
+			shutdownConnection(crec);
 		}
-		io_uring_cqe_seen(&uring,cqe);
-		return;
 	} else {
 		if (cqe->res < crec->iov.iov_len) {
-			/* Short read or write. */
+			/* Short read or write. Adjust the data pointer and
+			 length and requeue. */
 			crec->remaining -= cqe->res;
 			crec->iov.iov_len -= cqe->res;
 			crec->iov.iov_base += cqe->res;
 			if (crec->cstat == CONN_READ) {
 				crec->offset += cqe->res;
 			}
-			if (verbose) printf("requeue (short %d) @offset %ld\n",cqe->res,crec->offset);
+			if (verbose >= 2) printf("requeue (short %d) @offset %ld\n",cqe->res,crec->offset);
 			requeue(cqe,crec,0);
-			io_uring_cqe_seen(&uring,cqe);
 		} else {
+			/* The entire I/O operation completed successfully. We have
+			   the complete crec->io_buffer full of data. */
 			if (crec->cstat == CONN_READ) {
 				/* Read complete. Update offset and then queue the
 				   corresponding write. */
@@ -391,39 +468,110 @@ static void processCompletion(struct io_uring_cqe *cqe)
 					queue_read(crec);
 				}
 			}
-			io_uring_cqe_seen(&uring,cqe);
 		}
 	}
+	/* Tell the kernel we are done with the CQE. */
+	io_uring_cqe_seen(&uring,cqe);
 }
 
+/* Becomes true when ^C is pressed. */
+static int stopService = 0;
+
+/* Handle ^C by setting the "stop" flag. */
 void sigint_handler(int sig)
 {
-	if (sock > 0) {
-		close(sock);
-		puts("closed socket");
-	}
+	stopService = 1;
 }
 
-int main(int argc,char *argv[])
+/* Create a socket and bind it to port as a listener. */
+static int setupListenSocket(int port)
 {
-	int port,rc,ii;
-	struct sockaddr_in addr,peer;
-	fd_set connect_fds;
+	struct sockaddr_in addr;
+	int rc,sock;
+	const int one = 1;
 	const int BACKLOG = 8;
-	int did_something;
-	struct timeval timeout;
-	int one = 1;
-	char fname[FNAME_SZ];
 
+	/* Configure the address to bind. We listen on all interfaces. */
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(port);
+	addr.sin_addr.s_addr = htonl(0);
+
+	/* Create the server socket. */
+	sock = socket(AF_INET,SOCK_STREAM,0);
+	if (sock < 0) {
+		perror("creating server socket");
+		return errno;
+	}
+
+	/* Re-use the port, so we can re-bind after exiting. */
+	rc = setsockopt(sock,SOL_SOCKET,SO_REUSEADDR,&one,sizeof(one));
+	if (rc < 0) {
+		perror("re-using address");
+		return errno;
+	}
+
+	/* Bind to the port. */
+	rc = bind(sock,(struct sockaddr*)&addr,sizeof(addr));
+	if (rc < 0) {
+		perror("binding socket");
+		return errno;
+	}
+
+	/* Start listening for connections. */
+	rc = listen(sock,BACKLOG);
+
+	return sock;
+}
+
+/* Count the number of 'v' characters in a string. */
+static int countVs(char const *s)
+{
+	int cc;
+	for (cc=0; *s; ++s) {
+		if (*s == 'v') ++cc;
+	}
+	return cc;
+}
+
+/* Parse the command-line arguments. There are only two
+   possible arguments:
+
+   1) The port to listen on (mandatory).
+   2) -v[vv..] - verbosity level (optional). More v's == more output.
+   */
+static int parseArgs(int argc, char *argv[])
+{
+	int ii;
+	int port = atoi(argv[1]);
 	if (argc < 2) {
 		usage();
 		exit(0);
 	}
 
-	for (ii=1; ii<argc; ++ii) {
+	for (ii=2; ii<argc; ++ii) {
 		if (!strncmp(argv[ii],"-v",2)) {
-			verbose = 1;
+			verbose = countVs(argv[ii]);
 		}
+	}
+
+	return port;
+}
+
+int main(int argc,char *argv[])
+{
+	int port,rc,ii;
+	struct sockaddr_in peer;
+	fd_set connect_fds;
+	int did_something;
+	struct timeval timeout;
+	int one = 1;
+	char fname[FNAME_SZ];
+	int idle_loops = 0;
+
+	port = parseArgs(argc,argv);
+	if (port <= 0) {
+		usage();
+		exit(1);
 	}
 
 	signal(SIGINT,sigint_handler);
@@ -436,57 +584,58 @@ int main(int argc,char *argv[])
 		exit(errno);
 	}
 
-	port = atoi(argv[1]);
-	addr.sin_family = AF_INET;
-	addr.sin_port = htons(port);
-	addr.sin_addr.s_addr = htonl(0);
-
-	sock = socket(AF_INET,SOCK_STREAM,0);
+	sock = setupListenSocket(port);
 	if (sock < 0) {
-		perror("creating server socket");
 		exit(errno);
 	}
 
-	rc = setsockopt(sock,SOL_SOCKET,SO_REUSEADDR,&one,sizeof(one));
-	if (rc < 0) {
-		perror("re-using address");
-		exit(errno);
-	}
-
-	rc = bind(sock,(struct sockaddr*)&addr,sizeof(addr));
-	if (rc < 0) {
-		perror("binding socket");
-		exit(errno);
-	}
-
-	rc = listen(sock,BACKLOG);
-
+	/* If we took any I/O action during a given trip through
+	   the processing loop, this becomes true and we select()
+	   with 0 timeout, anticipating some immediate additional
+	   activity. Otherwise we select() with a 10ms timeout. */
 	did_something = 0;
+
+	/* Set up the select() timeout. */
 	timeout.tv_sec = 0;
-	while (1) {
+
+	/* The connection processing loop. */
+	while (!stopService) {
 		int conn_fd;
 		socklen_t peerlen = sizeof(peer);
 		struct connection_rec* conn_rec;
 		int conn_idx;
+
 		if (did_something) {
+			if (verbose > 5) printf("I/O after %d idle loops\n",idle_loops);
 			timeout.tv_usec = 0;
+			idle_loops = 0;
 		} else {
+			if (verbose > 10) printf("no active I/O, select for 10μs\n");
+			++idle_loops;
 			timeout.tv_usec = 10;
 		}
+		did_something = 0;
+		
+		/* See if there is a new connection to handle. */
 		FD_SET(sock,&connect_fds);
 		rc = select(sock+1,&connect_fds,0,0,&timeout);
 		if (rc < 0) {
 			perror("select");
 			exit(errno);
 		}
+
 		if (rc > 0) {
+			/* Accept the new connection. */
 			conn_fd = accept(sock,(struct sockaddr*)&peer,&peerlen);
 			if (conn_fd < 0) {
 				perror("accept");
 				exit(errno);
 			}
 
-			/* We have a new connection. Start handling it. */
+			/* We have a new connection. Start handling it. We read
+			 a filename from the client using a regular read() call.
+			 Once we have the filename, all further I/O is handled
+			 via io_uring. */
 			rc = readFname(conn_fd,fname,FNAME_SZ);
 			if (rc == 0) {
 				conn_rec = buildConnectionRecord(conn_fd,fname);
@@ -495,7 +644,10 @@ int main(int argc,char *argv[])
 					close(conn_fd);
 				}
 			}
-			
+
+			if (verbose) printf("+Now serving %d connections.\n",countConnections());
+			fflush(stdout);
+
 			did_something = 1;
 		}
 
@@ -513,11 +665,11 @@ int main(int argc,char *argv[])
 		/* See if there are uring completions to process. */
 		{
 			struct io_uring_cqe* cqe;
-			rc = io_uring_peek_cqe(&uring,&cqe);
-			while (rc == 0 && cqe) {
+			for (rc = io_uring_peek_cqe(&uring,&cqe);
+					rc == 0 && cqe;
+					rc = io_uring_peek_cqe(&uring,&cqe)) {
 				did_something = 1;
 				processCompletion(cqe);
-				rc = io_uring_peek_cqe(&uring,&cqe);
 			}
 		}
 	}
