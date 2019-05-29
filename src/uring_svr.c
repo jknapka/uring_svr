@@ -51,10 +51,12 @@
  *
  * - We use a single kernel io_uring for all async I/O requests.
  *
+ * - We use a single thread to handle all I/O activity.
+ *
  * - We allow at most one I/O request to be outstanding
  *   for any given connection, either a read or a write.
  *   We read a block into a buffer from a file, then write
- *   that same block to the connected socket. This is the
+ *   that same buffer to the connected socket. This is the
  *   main inefficiency in this code, but it makes the
  *   bookkeeping dead easy. A future version may
  *   do something smarter.
