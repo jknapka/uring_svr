@@ -594,7 +594,7 @@ int main(int argc,char *argv[])
 	/* If we took any I/O action during a given trip through
 	   the processing loop, this becomes true and we select()
 	   with 0 timeout, anticipating some immediate additional
-	   activity. Otherwise we select() with a 10ms timeout. */
+	   activity. Otherwise we select() with a 10μs timeout. */
 	did_something = 0;
 
 	/* Set up the select() timeout. */
