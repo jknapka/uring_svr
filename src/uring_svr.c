@@ -119,6 +119,7 @@ static const int URING_DEPTH = 128;
 /* Maximum number of simultaneous connections we support. */
 #define MAX_CONNECTIONS 128
 
+/* Size of the buffer into which we read filenames from clients. */
 static const int FNAME_SZ = 1024;
 
 /* All connection records. */
@@ -215,6 +216,7 @@ static struct connection_rec* buildConnectionRecord(int conn_fd,char* fname)
 	if (file_fd < 0) {
 		rc = write(conn_fd,"Could not open file",19);
 		perror("opening file");
+		close(conn_fd);
 		return 0;
 	}
 
@@ -223,6 +225,8 @@ static struct connection_rec* buildConnectionRecord(int conn_fd,char* fname)
 	if (rc < 0) {
 		rc = write(conn_fd,"Could not stat file",19);
 		perror("get file size");
+		close(file_fd);
+		close(conn_fd);
 		return 0;
 	}
 
@@ -230,6 +234,8 @@ static struct connection_rec* buildConnectionRecord(int conn_fd,char* fname)
 	conn_rec = getConnectionRecord();
 	if (!conn_rec) {
 		rc = write(conn_fd,"Too many connections",20);
+		close(file_fd);
+		close(conn_fd);
 		return 0;
 	}
 
@@ -244,6 +250,8 @@ static struct connection_rec* buildConnectionRecord(int conn_fd,char* fname)
 	if (!conn_rec->io_buffer) {
 		/* Could not allocate a buffer. Free the conn_rec. */
 		rc = write(conn_fd,"Memory failure",14);
+		close(file_fd);
+		close(conn_fd);
 		conn_rec->conn_fd = -1;
 		return 0;
 	}
@@ -251,7 +259,7 @@ static struct connection_rec* buildConnectionRecord(int conn_fd,char* fname)
 	return conn_rec;
 }
 
-/* Initialize an ui_uring instance for async I/O. */
+/* Initialize an io_uring instance for async I/O. */
 static int setupUring(struct io_uring* uring)
 {
 	int rc;
