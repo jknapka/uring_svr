@@ -27,6 +27,11 @@
  *
  *  echo <filename> | nc <server.address> <port>
  *
+ * The given <filename> must exist *on the server* in a place
+ * accessible to the server process. It can be specified as
+ * an absolute path or as a path relative to the uring_svr
+ * process's working directory.
+ *
  * Implementation notes:
  *
  * - You must be running kernel 5.1.0 or higher for this
