@@ -90,7 +90,7 @@
 #include <sys/fcntl.h>
 #include <string.h>
 #include <signal.h>
-#include <io_uring.h>
+#include <liburing/io_uring.h>
 #include <liburing.h>
 
 /* If true, print some info while serving files. */
@@ -406,6 +406,7 @@ static void shutdownConnection(struct connection_rec *crec)
 	if (verbose >= 3) printf("closed connection, rc=%d\n",rc);
 	rc = close(crec->file_fd);
 	if (verbose >= 3) printf("closed file, rc=%d\n",rc);
+	free(crec->io_buffer);
 	crec->conn_fd = -1; /* Frees the connection_rec. */
 	if (verbose) printf("-Now serving %d connections.\n",countConnections());
 }
