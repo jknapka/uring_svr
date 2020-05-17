@@ -116,7 +116,7 @@ struct connection_rec {
 							    (Or'd with other values.)*/
 
 /* Size of I/O buffers. */
-static const int IOBLOCK_SIZE = 1024;
+static const int IOBLOCK_SIZE = 16;
 
 /* How deep the uring should be */
 static const int URING_DEPTH = 128;
