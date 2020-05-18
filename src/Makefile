@@ -1,5 +1,6 @@
 DBGFLAGS = -g
 LDFLAGS = -luring
+CFLAGS = -g
 
 all: uring_svr
 

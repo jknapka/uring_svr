@@ -116,7 +116,7 @@ struct connection_rec {
 							    (Or'd with other values.)*/
 
 /* Size of I/O buffers. */
-static const int IOBLOCK_SIZE = 16;
+static const int IOBLOCK_SIZE = 16384;
 
 /* How deep the uring should be */
 static const int URING_DEPTH = 128;
@@ -202,7 +202,7 @@ static int readFname(int fd,char *fname,size_t len)
 		}
 	}
 
-	if (verbose >= 4) printf("Read filename: %s %ld\n",fname,strlen(fname));
+	if (verbose) printf("Read filename: %s %ld\n",fname,strlen(fname));
 
 	return 0;
 }
@@ -371,10 +371,11 @@ static int queue_write(struct connection_rec *crec)
    errcode is the error code of the completion. */
 static int requeue(struct io_uring_cqe* cqe,struct connection_rec* crec,int errcode)
 {
-	/* Objtain a new sqe. */
+	/* Obtain a new sqe. */
 	struct io_uring_sqe *sqe = io_uring_get_sqe(&uring);
 	if (!sqe) {
 		/* We need to requeue this again after a while. */
+		printf("NEED TO REQUEUE - COULD NOT GET AN SQE");
 		crec->cstat |= CONN_NEED_REQUEUE;
 		return -1;
 	}
@@ -408,7 +409,10 @@ static void shutdownConnection(struct connection_rec *crec)
 	if (verbose >= 3) printf("closed file, rc=%d\n",rc);
 	free(crec->io_buffer);
 	crec->conn_fd = -1; /* Frees the connection_rec. */
-	if (verbose) printf("-Now serving %d connections.\n",countConnections());
+	if (verbose) {
+		printf("-Now serving %d connections.\n",countConnections());
+		fflush(stdout);
+	}
 }
 
 /* If a connection_rec requires any action that is not
@@ -429,9 +433,12 @@ static int processConnection(struct connection_rec *crec)
 		if (crec->cstat == CONN_READ) {
 			/* Last read complete. Queue the corresponding write. */
 			queue_write(crec);
-		} else {
+		} else if (crec->cstat == CONN_WRITE) {
 			/* This connection is complete and can be shut down. */
-			shutdownConnection(crec);
+			/* NO. We need to wait for the completion of the final write. */
+			/*shutdownConnection(crec);*/
+		} else {
+			printf("processConnection(): UNEXPECTED CONNECTION STATE %d\n",crec->cstat);
 		}
 	}
 	/* All other cases are handled during uring completion processing. */
@@ -453,36 +460,56 @@ static void processCompletion(struct io_uring_cqe *cqe)
 		} else {
 			/* We're not sure what happened here... probably best
 			 to shut down the connection. */
-			perror("processing completion");
-			printf("cqe->res == %d, EAGAIN == %d\n",cqe->res,EAGAIN);
+			errno = -cqe->res;
+			/*perror("processing completion");*/
+			printf("DROPPING CONNECTION - cqe->res == %d, EAGAIN == %d\n, addr == %ld, len == %ld",cqe->res,EAGAIN,crec->iov.iov_base,crec->iov.iov_len);
 			shutdownConnection(crec);
 		}
 	} else {
 		if (cqe->res < crec->iov.iov_len) {
 			/* Short read or write. Adjust the data pointer and
 			 length and requeue. */
-			crec->remaining -= cqe->res;
+			if (verbose >= 2) {
+				printf("(short %s %d) req addr %ld req len %ld @offset %ld, %ld remaining\n",
+						(crec->cstat==CONN_READ?"read":"write"),
+						cqe->res,
+						crec->iov.iov_base,crec->iov.iov_len,
+						crec->offset,crec->remaining);
+			}
+			/* Adjust the iovec to send the remainder of the data. */
 			crec->iov.iov_len -= cqe->res;
 			crec->iov.iov_base += cqe->res;
 			if (crec->cstat == CONN_READ) {
 				crec->offset += cqe->res;
+				crec->remaining -= cqe->res;
 			}
-			if (verbose >= 2) printf("requeue (short %d) @offset %ld\n",cqe->res,crec->offset);
+			if (verbose >= 2) printf("   adjusted addr %ld, adj len %ld\n",crec->iov.iov_base,
+					crec->iov.iov_len);
 			requeue(cqe,crec,0);
 		} else {
 			/* The entire I/O operation completed successfully. We have
 			   the complete crec->io_buffer full of data. */
+			if (crec->iov.iov_len < IOBLOCK_SIZE) {
+				if (verbose >= 3) printf("Apparent short %s complete addr %ld len %ld, remaining %ld\n",
+						(crec->cstat==CONN_READ?"read":"write"),
+						crec->iov.iov_base,crec->iov.iov_len,crec->remaining);
+			}
 			if (crec->cstat == CONN_READ) {
 				/* Read complete. Update offset and then queue the
 				   corresponding write. */
 				crec->offset += cqe->res;
 				crec->remaining -= cqe->res;
 				queue_write(crec);
-			} else {
+			} else if (crec->cstat == CONN_WRITE) {
 				/* Write complete. Queue the next read. */
 				if (crec->remaining > 0) {
 					queue_read(crec);
+				} else {
+					/* This connection is complete and can be shut down. */
+					shutdownConnection(crec);
 				}
+			} else {
+				printf("processCompletion(): UNEXPECTED CONNECTION STATE %d\n",crec->cstat);
 			}
 		}
 	}
@@ -505,7 +532,7 @@ static int setupListenSocket(int port)
 	struct sockaddr_in addr;
 	int rc,sock;
 	const int one = 1;
-	const int BACKLOG = 8;
+	const int BACKLOG = 100;
 
 	/* Configure the address to bind. We listen on all interfaces. */
 	addr.sin_family = AF_INET;
@@ -626,7 +653,7 @@ int main(int argc,char *argv[])
 			timeout.tv_usec = 0;
 			idle_loops = 0;
 		} else {
-			if (verbose > 10) printf("no active I/O, select for 10μs\n");
+			/*if (verbose > 6) printf("no active I/O, select for 10μs\n");*/
 			++idle_loops;
 			timeout.tv_usec = 10;
 		}
@@ -657,11 +684,16 @@ int main(int argc,char *argv[])
 				conn_rec = buildConnectionRecord(conn_fd,fname);
 				if (!conn_rec) {
 					/* Could not set up connection. */
+					puts("ERROR: Could not set up connection.\n");
+					fflush(stdout);
 					close(conn_fd);
 				}
 			}
 
-			if (verbose) printf("+Now serving %d connections.\n",countConnections());
+			if (verbose) {
+				printf("+Now serving %d connections.\n",countConnections());
+				fflush(stdout);
+			}
 			fflush(stdout);
 
 			did_something = 1;
