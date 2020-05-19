@@ -122,7 +122,7 @@ struct connection_rec {
 							    (Or'd with other values.)*/
 
 /* Size of I/O buffers. TO DO: adjust via command line. */
-static const int IOBLOCK_SIZE = 1024*1024;
+static size_t IOBLOCK_SIZE = 1024*1024;
 
 /* How deep the uring should be. We will only have one outstanding
  * uring entry for each active connection, but we can have many
@@ -270,6 +270,9 @@ static struct connection_rec* buildConnectionRecord(int conn_fd,char* fname,
 		close(conn_fd);
 		conn_rec->conn_fd = -1;
 		return 0;
+	}
+	if (verbose > 1) {
+		printf("Built connection record with %ld bytes I/O space for %s to %s:%u\n",IOBLOCK_SIZE,fname,conn_rec->peer_ip,conn_rec->peer_port);
 	}
 
 	return conn_rec;
@@ -593,11 +596,50 @@ static int countVs(char const *s)
 	return cc;
 }
 
-/* Parse the command-line arguments. There are only two
+/*
+ * Parse the I/O block size argument. The format is:
+ * [0-9]+[BKMG] where B, K, M and G are interpreted
+ * as bytes, kibibytes, mebibytes, gibibytes. If
+ * no unit is provided, bytes are assumed.
+ */
+size_t parseBlockSize(char* bss)
+{
+	size_t result = 0;
+	int len = strlen(bss);
+	char last = bss[len-1];
+	int base = 0;
+	int multiplier = 1;
+	switch (last) {
+	case 'B':
+	case 'b':
+		break;
+	case 'K':
+	case 'k':
+		multiplier = 1024;
+		break;
+	case 'M':
+	case 'm':
+		multiplier = 1024*1024;
+		break;
+	case 'G':
+	case 'g':
+		multiplier = 1024*1024*1024;
+		break;
+	default:
+		multiplier = 1;
+	}
+	base = atoi(bss);
+	result = base * multiplier;
+	return result;
+}
+
+/* Parse the command-line arguments. There are only three
    possible arguments:
 
    1) The port to listen on (mandatory).
    2) -v[vv..] - verbosity level (optional). More v's == more output.
+   3) -bn[BKVM] I/O buffer size = n bytes, nKiB, nMiB, or nGiB. if
+      the unit value is omitted bytes are assumed.
    */
 static int parseArgs(int argc, char *argv[])
 {
@@ -611,6 +653,9 @@ static int parseArgs(int argc, char *argv[])
 	for (ii=2; ii<argc; ++ii) {
 		if (!strncmp(argv[ii],"-v",2)) {
 			verbose = countVs(argv[ii]);
+		}
+		if (!strncmp(argv[ii],"-b",2)) {
+			IOBLOCK_SIZE = parseBlockSize(argv[ii]+2);
 		}
 	}
 
