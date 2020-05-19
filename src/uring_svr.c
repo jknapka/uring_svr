@@ -96,6 +96,9 @@
 /* If true, print some info while serving files. */
 int verbose = 0;
 
+/* Size of the buffer into which we read filenames from clients. */
+#define FNAME_SZ 1024
+
 /* Keep track of the data associated with a file being served. */
 struct connection_rec {
 	int conn_fd;       /* The fd of the client socket. */
@@ -106,6 +109,9 @@ struct connection_rec {
 	int cstat;         /* 0 = idle, 1 = waiting for read, 2 = waiting for write. */
 	struct iovec iov;  /* iovec to give to the uring API. */
 	char* io_buffer;   /* Buffer for reads and writes for this connection and file. */
+	char file_name[FNAME_SZ]; /*For logging purposes. */
+	char peer_ip[16];
+	unsigned short peer_port;
 };
 
 /* States of connection_rec->cstat. */
@@ -115,17 +121,16 @@ struct connection_rec {
 #define CONN_NEED_REQUEUE 4  /* An I/O operation failed and needs to be retried.
 							    (Or'd with other values.)*/
 
-/* Size of I/O buffers. */
-static const int IOBLOCK_SIZE = 16384;
+/* Size of I/O buffers. TO DO: adjust via command line. */
+static const int IOBLOCK_SIZE = 1024*1024;
 
-/* How deep the uring should be */
+/* How deep the uring should be. We will only have one outstanding
+ * uring entry for each active connection, but we can have many
+ * active connections. */
 static const int URING_DEPTH = 128;
 
 /* Maximum number of simultaneous connections we support. */
 #define MAX_CONNECTIONS 128
-
-/* Size of the buffer into which we read filenames from clients. */
-static const int FNAME_SZ = 1024;
 
 /* All connection records. */
 static struct connection_rec connections[MAX_CONNECTIONS];
@@ -210,7 +215,8 @@ static int readFname(int fd,char *fname,size_t len)
 /* Initialize the connection_rec to serve a given filename
    on a connected socket. Return a pointer to the initialized
    connection_rec, or NULL if initialization fails. */
-static struct connection_rec* buildConnectionRecord(int conn_fd,char* fname)
+static struct connection_rec* buildConnectionRecord(int conn_fd,char* fname,
+		unsigned int peer_ip,unsigned short peer_port)
 {
 	int rc, file_fd, uring_fd;
 	struct stat stat_buf;
@@ -250,8 +256,13 @@ static struct connection_rec* buildConnectionRecord(int conn_fd,char* fname)
 	conn_rec->remaining = stat_buf.st_size;
 	conn_rec->last_read = 0;
 	conn_rec->offset = 0;
-	conn_rec->io_buffer = (char*)malloc(IOBLOCK_SIZE);
 	conn_rec->cstat = CONN_IDLE;
+	strncpy(conn_rec->file_name,fname,FNAME_SZ);
+	sprintf(conn_rec->peer_ip,"%u.%u.%u.%u",
+			(0x000000FF & (peer_ip>>24)),(0x000000FF &(peer_ip>>16)),
+				(0x000000FF &(peer_ip>>8)),(0x000000FF & peer_ip));
+	conn_rec->peer_port = peer_port;
+	conn_rec->io_buffer = (char*)malloc(IOBLOCK_SIZE);
 	if (!conn_rec->io_buffer) {
 		/* Could not allocate a buffer. Free the conn_rec. */
 		rc = write(conn_fd,"Memory failure",14);
@@ -326,7 +337,7 @@ static int queue_read(struct connection_rec *crec)
 	   will notify us via the completion queue when the operation
 	   completes. */
 
-	if (verbose >= 5) printf("queue_read @offset %ld with %ld remaining\n",crec->offset,crec->remaining);
+	if (verbose >= 5) printf("queue_read %s @offset %ld with %ld remaining to %s:%u\n",crec->file_name,crec->offset,crec->remaining,crec->peer_ip,crec->peer_port);
 	return 0;
 }
 
@@ -358,7 +369,7 @@ static int queue_write(struct connection_rec *crec)
 	/* Submit the SQE to the kernel. */
 	io_uring_submit(&uring);
 
-	if (verbose >= 5) printf("queue_write @offset %ld with %ld remaining\n",crec->offset,crec->remaining);
+	if (verbose >= 5) printf("queue_write for %s @offset %ld with %ld remaining\n to %s:%u\n",crec->file_name,crec->offset,crec->remaining,crec->peer_ip,crec->peer_port);
 	return 0;
 }
 
@@ -403,6 +414,8 @@ static int requeue(struct io_uring_cqe* cqe,struct connection_rec* crec,int errc
 static void shutdownConnection(struct connection_rec *crec)
 {
 	int rc;
+	if (verbose) printf("Shutting down connection for %s to %s:%u\n",
+			crec->file_name,crec->peer_ip,crec->peer_port);
 	rc = close(crec->conn_fd);
 	if (verbose >= 3) printf("closed connection, rc=%d\n",rc);
 	rc = close(crec->file_fd);
@@ -470,11 +483,13 @@ static void processCompletion(struct io_uring_cqe *cqe)
 			/* Short read or write. Adjust the data pointer and
 			 length and requeue. */
 			if (verbose >= 2) {
-				printf("(short %s %d) req addr %ld req len %ld @offset %ld, %ld remaining\n",
+				printf("(short %s %d) of %s req addr %ld req len %ld @offset %ld, %ld remaining to %s:%u\n",
 						(crec->cstat==CONN_READ?"read":"write"),
 						cqe->res,
+						crec->file_name,
 						crec->iov.iov_base,crec->iov.iov_len,
-						crec->offset,crec->remaining);
+						crec->offset,crec->remaining,
+						crec->peer_ip,crec->peer_port);
 			}
 			/* Adjust the iovec to send the remainder of the data. */
 			crec->iov.iov_len -= cqe->res;
@@ -490,9 +505,11 @@ static void processCompletion(struct io_uring_cqe *cqe)
 			/* The entire I/O operation completed successfully. We have
 			   the complete crec->io_buffer full of data. */
 			if (crec->iov.iov_len < IOBLOCK_SIZE) {
-				if (verbose >= 3) printf("Apparent short %s complete addr %ld len %ld, remaining %ld\n",
+				if (verbose >= 3) printf("Apparent short %s of %s complete addr %ld len %ld, remaining %ld to %s:%u\n",
 						(crec->cstat==CONN_READ?"read":"write"),
-						crec->iov.iov_base,crec->iov.iov_len,crec->remaining);
+						crec->file_name,
+						crec->iov.iov_base,crec->iov.iov_len,crec->remaining,
+						crec->peer_ip,crec->peer_port);
 			}
 			if (crec->cstat == CONN_READ) {
 				/* Read complete. Update offset and then queue the
@@ -674,6 +691,8 @@ int main(int argc,char *argv[])
 				perror("accept");
 				exit(errno);
 			}
+			unsigned int peer_ip = ntohl(peer.sin_addr.s_addr);
+			unsigned short peer_port = ntohs(peer.sin_port);
 
 			/* We have a new connection. Start handling it. We read
 			 a filename from the client using a regular read() call.
@@ -681,7 +700,7 @@ int main(int argc,char *argv[])
 			 via io_uring. */
 			rc = readFname(conn_fd,fname,FNAME_SZ);
 			if (rc == 0) {
-				conn_rec = buildConnectionRecord(conn_fd,fname);
+				conn_rec = buildConnectionRecord(conn_fd,fname,peer_ip,peer_port);
 				if (!conn_rec) {
 					/* Could not set up connection. */
 					puts("ERROR: Could not set up connection.\n");
