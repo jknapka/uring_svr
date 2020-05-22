@@ -91,7 +91,7 @@ echo
 
 echo Append a bit onto 1G.dat and fetch again.
 echo 0123456789 >> data/1G.dat
-start_uring_svr 16384B 1
+start_uring_svr 16M 1
 fetch_files 1 data/1G.dat
 wait $URING_SVR_PID
 verify_files 1 data/1G.dat
