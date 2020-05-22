@@ -96,6 +96,12 @@
 /* If true, print some info while serving files. */
 int verbose = 0;
 
+/* If >0, exit after serving that many files. */
+int exit_after_serving = 0;
+
+/* Number of files served. */
+int files_served = 0;
+
 /* Size of the buffer into which we read filenames from clients. */
 #define FNAME_SZ 1024
 
@@ -121,7 +127,7 @@ struct connection_rec {
 #define CONN_NEED_REQUEUE 4  /* An I/O operation failed and needs to be retried.
 							    (Or'd with other values.)*/
 
-/* Size of I/O buffers. TO DO: adjust via command line. */
+/* Size of per connection I/O buffers. Adjust via command line using -bn[BKMG]. */
 static size_t IOBLOCK_SIZE = 1024*1024;
 
 /* How deep the uring should be. We will only have one outstanding
@@ -144,7 +150,12 @@ int sock = 0;
 /* Print a simple usage message. */
 static void usage()
 {
-	puts("Usage: uring_svr <port> [-v]");
+	puts("Usage: uring_svr <port> [-v] [-bN[BKMG] -nN");
+	puts("  <port> specifies the listen port.");
+	puts("  -v[vvvv] specifies verbosity (more v's, more verbose).");
+	puts("  -bN[BKMG] specifies the size of I/O buffers in bytes, KiB");
+	puts("            MiB, or GiB, respectively.");
+	puts("  -nN means 'exit after sending N files'. This supports testing.");
 }
 
 /* Do basic initialization of all connection_recs. */
@@ -272,7 +283,7 @@ static struct connection_rec* buildConnectionRecord(int conn_fd,char* fname,
 		return 0;
 	}
 	if (verbose > 1) {
-		printf("Built connection record with %ld bytes I/O space for %s to %s:%u\n",IOBLOCK_SIZE,fname,conn_rec->peer_ip,conn_rec->peer_port);
+		printf("Built connection record with %ld bytes I/O space for %s to %s:%u with conn_fd=%d\n",IOBLOCK_SIZE,fname,conn_rec->peer_ip,conn_rec->peer_port,conn_rec->conn_fd);
 	}
 
 	return conn_rec;
@@ -395,9 +406,11 @@ static int requeue(struct io_uring_cqe* cqe,struct connection_rec* crec,int errc
 	}
 	if (crec->cstat == CONN_WRITE) {
 		/* This was an incomplete write, so prep a new write. */
+		if (verbose>4) puts("Requeueing a write.");
 		io_uring_prep_writev(sqe,crec->conn_fd,&crec->iov,1,0);
 	} else {
 		/* This was an incomplate read, so prep a new read. */
+		if (verbose>4) puts("Requeueing a read.");
 		io_uring_prep_readv(sqe,crec->file_fd,&crec->iov,1,crec->offset);
 	}
 
@@ -408,6 +421,9 @@ static int requeue(struct io_uring_cqe* cqe,struct connection_rec* crec,int errc
 
 	/* Submit the new SQE. */
 	io_uring_submit(&uring);
+
+	if (verbose>4) puts("  Requeue complete.");
+	fflush(stdout);
 
 	return 0;
 }
@@ -429,33 +445,36 @@ static void shutdownConnection(struct connection_rec *crec)
 		printf("-Now serving %d connections.\n",countConnections());
 		fflush(stdout);
 	}
+
+	// To support testing.
+	++files_served;
+	if (verbose) printf("%d files fully served.\n",files_served);
 }
 
 /* If a connection_rec requires any action that is not
    handled during io_uring completion processing, do
-   that here. */
+   that here. This means:
+  
+ 1. starting up new, IDLE connections by queueing an initial
+    read into the uring layer.
+ 2. Re-queueing uring requests that could not be submitted.
+ */
 static int processConnection(struct connection_rec *crec)
 {
+	if (verbose) printf("Processing connection for %s with conn_fd=%d, file_fd=%d   and cstat=%d\n",
+			crec->file_name,crec->conn_fd,crec->file_fd,crec->cstat);
+	fflush(stdout);
 	if (crec->cstat == CONN_IDLE) {
 		/* This is a new connection. We must queue a file read. */
+		if (verbose > 4) printf("Starting IDLE connection for %s\n",
+				crec->file_name);
 		queue_read(crec);
 	} else if (crec->cstat & CONN_NEED_REQUEUE) {
 		/* A previous I/O operation completed erroneously and
 		   could not be requeued at the time. Try to requeue again. */
+		printf("WARNING: requeueing a FAILED SQE for %s\n",crec->file_name);
 		crec->cstat &= ~CONN_NEED_REQUEUE;
 		requeue(0,crec,0);
-	} else if (crec->remaining == 0) {
-		/* We have successfully read the entire file. */
-		if (crec->cstat == CONN_READ) {
-			/* Last read complete. Queue the corresponding write. */
-			queue_write(crec);
-		} else if (crec->cstat == CONN_WRITE) {
-			/* This connection is complete and can be shut down. */
-			/* NO. We need to wait for the completion of the final write. */
-			/*shutdownConnection(crec);*/
-		} else {
-			printf("processConnection(): UNEXPECTED CONNECTION STATE %d\n",crec->cstat);
-		}
 	}
 	/* All other cases are handled during uring completion processing. */
 	return 0;
@@ -501,7 +520,7 @@ static void processCompletion(struct io_uring_cqe *cqe)
 				crec->offset += cqe->res;
 				crec->remaining -= cqe->res;
 			}
-			if (verbose >= 2) printf("   adjusted addr %ld, adj len %ld\n",crec->iov.iov_base,
+			if (verbose >= 2) printf("   requeueing with adjusted addr %ld, adj len %ld\n",crec->iov.iov_base,
 					crec->iov.iov_len);
 			requeue(cqe,crec,0);
 		} else {
@@ -519,12 +538,18 @@ static void processCompletion(struct io_uring_cqe *cqe)
 				   corresponding write. */
 				crec->offset += cqe->res;
 				crec->remaining -= cqe->res;
+				if (verbose>2) printf("Read complete for %s to %s:%u, queueing write.\n",
+						crec->file_name,crec->peer_ip,crec->peer_port);
 				queue_write(crec);
 			} else if (crec->cstat == CONN_WRITE) {
 				/* Write complete. Queue the next read. */
 				if (crec->remaining > 0) {
+					if (verbose>2) printf("Write complete for %s to %s:%u\n",
+							crec->file_name,crec->peer_ip,crec->peer_port);
 					queue_read(crec);
 				} else {
+					if (verbose>2) printf("FINAL write complete for %s to %s:%u\n",
+							crec->file_name,crec->peer_ip,crec->peer_port);
 					/* This connection is complete and can be shut down. */
 					shutdownConnection(crec);
 				}
@@ -535,6 +560,8 @@ static void processCompletion(struct io_uring_cqe *cqe)
 	}
 	/* Tell the kernel we are done with the CQE. */
 	io_uring_cqe_seen(&uring,cqe);
+
+	fflush(stdout);
 }
 
 /* Becomes true when ^C is pressed. */
@@ -633,13 +660,15 @@ size_t parseBlockSize(char* bss)
 	return result;
 }
 
-/* Parse the command-line arguments. There are only three
+/* Parse the command-line arguments. There are only 4
    possible arguments:
 
    1) The port to listen on (mandatory).
    2) -v[vv..] - verbosity level (optional). More v's == more output.
    3) -bn[BKVM] I/O buffer size = n bytes, nKiB, nMiB, or nGiB. if
       the unit value is omitted bytes are assumed.
+   4) -nN - exit after serving N files. This is to support automated
+      testing. If not specified, defaults to infinity.
    */
 static int parseArgs(int argc, char *argv[])
 {
@@ -656,6 +685,10 @@ static int parseArgs(int argc, char *argv[])
 		}
 		if (!strncmp(argv[ii],"-b",2)) {
 			IOBLOCK_SIZE = parseBlockSize(argv[ii]+2);
+		}
+		if (!strncmp(argv[ii],"-n",2)) {
+			exit_after_serving = atoi(argv[ii]+2);
+			printf("Will exit after serving %d files.\n",exit_after_serving);
 		}
 	}
 
@@ -722,6 +755,7 @@ int main(int argc,char *argv[])
 		did_something = 0;
 		
 		/* See if there is a new connection to handle. */
+		FD_ZERO(&connect_fds);
 		FD_SET(sock,&connect_fds);
 		rc = select(sock+1,&connect_fds,0,0,&timeout);
 		if (rc < 0) {
@@ -729,7 +763,7 @@ int main(int argc,char *argv[])
 			exit(errno);
 		}
 
-		if (rc > 0) {
+		if (rc > 0 && FD_ISSET(sock,&connect_fds)) {
 			/* Accept the new connection. */
 			conn_fd = accept(sock,(struct sockaddr*)&peer,&peerlen);
 			if (conn_fd < 0) {
@@ -756,7 +790,6 @@ int main(int argc,char *argv[])
 
 			if (verbose) {
 				printf("+Now serving %d connections.\n",countConnections());
-				fflush(stdout);
 			}
 			fflush(stdout);
 
@@ -770,8 +803,10 @@ int main(int argc,char *argv[])
 				/* This connection is in use. Process it. */
 				if (processConnection(&connections[conn_idx])) {
 					did_something = 1;
+					if (verbose > 4) printf("did_something in processConnections()\n");
 				}
 			}
+			fflush(stdout);
 		}
 
 		/* See if there are uring completions to process. */
@@ -780,9 +815,19 @@ int main(int argc,char *argv[])
 			for (rc = io_uring_peek_cqe(&uring,&cqe);
 					rc == 0 && cqe;
 					rc = io_uring_peek_cqe(&uring,&cqe)) {
-				did_something = 1;
+				if (verbose >5) printf("Got cqe\n");
 				processCompletion(cqe);
+				did_something = 1;
+				if (verbose > 4) printf("did_something while processing cqe's\n");
 			}
+			fflush(stdout);
+		}
+
+		/* See if we've finished serving the file limit. */
+		if ((exit_after_serving > 0) && (files_served >= exit_after_serving)) {
+			printf("Served maximum file limit of %d; exiting.\n",exit_after_serving);
+			fflush(stdout);
+			stopService = 1;
 		}
 	}
 
